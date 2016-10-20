@@ -1,0 +1,240 @@
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+#include <netdb.h>
+#include "hiredis.h"
+
+
+typedef struct {
+    ngx_rbtree_t rbtree;
+    ngx_rbtree_node_t sentinel;
+} task_rbt;
+
+typedef struct {
+    ngx_rbtree_node_t node;
+    ngx_str_t task;
+} task_node_t;
+
+typedef struct
+{
+    time_t my_sec; 
+    ngx_rbtree_t *t_rbt;
+    ngx_str_node_t *sentienl;
+    //ngx_rbtree_node_t *sentienl;
+} ngx_guangtong_timer_conf_t;
+
+
+static ngx_event_t ev;
+static ngx_cycle_t *cycle1;
+
+static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
+
+static void *ngx_guangtong_test_create_conf(ngx_conf_t *cf);
+static char *ngx_guangtong_test_merge_conf(ngx_conf_t *cf, void *parent, void *child);
+
+static ngx_int_t ngx_guangtong_test_init(ngx_conf_t *cf);
+static ngx_int_t ngx_guangtong_test_header_filter(ngx_http_request_t *r);
+
+static ngx_int_t init_process(ngx_cycle_t *cycle);
+
+static void refresh_rbt(ngx_rbtree_t *t_rbt, ngx_rbtree_node_t *sentienl);
+static void del_str_rbtree_node(ngx_str_node_t *delnode, ngx_rbtree_node_t *sentinel);
+
+static ngx_command_t  ngx_guangtong_timer_commands[] =
+{
+    {
+        ngx_string("guangtong_timer"),
+        NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_sec_slot,
+        NGX_HTTP_SRV_CONF_OFFSET,
+        offsetof(ngx_guangtong_timer_conf_t, my_sec),
+        NULL
+    },
+
+    ngx_null_command
+};
+
+
+static ngx_http_module_t  ngx_guangtong_timer_module_ctx =
+{
+    NULL,                                  /* preconfiguration方法  */
+    ngx_guangtong_test_init,            /* postconfiguration方法 */
+
+    NULL,                                  /*create_main_conf 方法 */
+    NULL,                                  /* init_main_conf方法 */
+
+    ngx_guangtong_test_create_conf,        /* create_srv_conf方法 */
+    // 因为这里是server的方法，如果不设置merge_srv_conf的话，默认会调用父模块的，而父模块在create_srv_conf里面设置了时间值为-1，所以必须要设置这个merge_srv_conf来得到正确的值
+    ngx_guangtong_test_merge_conf,         /* merge_srv_conf方法 */  
+
+    NULL,                               /* create_loc_conf方法 */
+    NULL                                /*merge_loc_conf方法*/
+};
+
+
+ngx_module_t  ngx_guangtong_timer_module =
+{
+    NGX_MODULE_V1,
+    &ngx_guangtong_timer_module_ctx,     /* module context */
+    ngx_guangtong_timer_commands,        /* module directives */
+    NGX_HTTP_MODULE,                       /* module type */
+    NULL,                                  /* init master */
+    NULL,                                  /* init module */
+    init_process,                          /* init process */
+    NULL,                                  /* init thread */
+    NULL,                                  /* exit thread */
+    NULL,                                  /* exit process */
+    NULL,                                  /* exit master */
+    NGX_MODULE_V1_PADDING
+};
+
+
+static void del_str_rbtree_node(ngx_str_node_t *delnode, ngx_rbtree_node_t *sentinel) {
+    printf("%d delete node %s\n", getpid(), delnode->str.data);
+    if (delnode->node.left != sentinel) {
+        del_str_rbtree_node((ngx_str_node_t *)delnode->node.left, sentinel);
+        delnode->node.left = sentinel;
+    }
+    if (delnode->node.right != sentinel) {
+        del_str_rbtree_node((ngx_str_node_t *)delnode->node.right, sentinel);
+        delnode->node.right = sentinel;
+    }
+    if (&(delnode->node) != sentinel) {
+        ngx_pfree(cycle1->pool, delnode->str.data);
+        ngx_str_null(&delnode->str);
+        ngx_pfree(cycle1->pool, delnode);
+    }
+    
+}
+
+static void refresh_rbt(ngx_rbtree_t *t_rbt, ngx_rbtree_node_t *sentienl) {
+    redisContext *robj = redisConnect("127.0.0.1", 6379);
+    if (robj == NULL || robj->err) {
+        if (robj) {
+            printf("Error: %s\n", robj->errstr);
+        } else {
+            printf("Can't allocate redis context\n");
+        }
+    }    
+    redisReply *reply = redisCommand(robj, "SMEMBERS ngx_set");
+    if (reply == NULL) {
+        printf("get NGX_set error!!!\n");
+    }
+    printf("SMEMBERS ngx_get result is %s\n", reply->str);
+    printf("SMEMBERS ngx_get len is %d\n", (int)reply->elements);
+
+    // 判断如果redis返回数据有值，就把红黑树中所有数据都删除
+    printf("%d reply type is %d\n", getpid(), reply->type);
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        if (reply->elements > 0) {
+            // 删除红黑树中所有的节点
+            printf("aaaabbbccd\n");
+            del_str_rbtree_node((ngx_str_node_t *)t_rbt->root, t_rbt->sentinel);
+        }
+        // 向红黑树中添加节点
+        unsigned int j;
+        for (j = 0; j < reply->elements; j++) {
+            printf("root addr is %p sentinel addr is %p\n", t_rbt->root, t_rbt->sentinel);
+            ngx_str_node_t *newnode = (ngx_str_node_t *)ngx_pcalloc(cycle1->pool, sizeof(ngx_str_node_t));
+            newnode->node.key = 0;
+            newnode->node.left = t_rbt->sentinel;
+            newnode->node.right = t_rbt->sentinel;
+            newnode->node.parent = t_rbt->sentinel;
+            newnode->str.data = (u_char *)ngx_pcalloc(cycle1->pool, 32);
+            size_t len = strlen(reply->element[j]->str);
+            printf("element is %d %s\n", j, reply->element[j]->str);
+            ngx_memcpy(newnode->str.data, reply->element[j]->str, len); 
+            newnode->str.len = len;
+            ngx_str_rbtree_insert_value(t_rbt->root, (ngx_rbtree_node_t *)newnode, t_rbt->sentinel);
+        }
+    }
+
+    freeReplyObject(reply);
+    redisFree(robj);
+}
+
+
+static void ngx_http_hello_print(ngx_event_t *p_ev) {
+    ngx_guangtong_timer_conf_t *ccf = (ngx_guangtong_timer_conf_t *)p_ev->data;
+    ngx_add_timer(p_ev, ccf->my_sec);
+    refresh_rbt(ccf->t_rbt, (ngx_rbtree_node_t *)ccf->sentienl);
+}
+
+static ngx_int_t init_process(ngx_cycle_t *cycle) {
+   printf("ffffffffffffffffffffffffffffffffff\n");
+   ngx_guangtong_timer_conf_t *p_conf = (ngx_guangtong_timer_conf_t *)(((ngx_http_conf_ctx_t*)cycle->conf_ctx[ngx_http_module.index])->srv_conf[ngx_guangtong_timer_module.ctx_index]);
+   //ngx_guangtong_timer_conf_t *p_conf = ngx_http_cycle_get_module_main_conf(cycle, ngx_guangtong_timer_module);
+   printf("dddddddddddddddddddddddddddddddddd\n");
+   cycle1 = cycle;
+   ev.handler = ngx_http_hello_print;  
+   ev.data = p_conf;
+   ev.log = cycle->log;  
+   printf("-----=-=-=-=-=-=-=-=-=--=%d\n", (int)p_conf->my_sec);
+   ngx_add_timer(&ev, p_conf->my_sec);
+   refresh_rbt(p_conf->t_rbt, (ngx_rbtree_node_t *)p_conf->sentienl);
+   return NGX_OK;
+}
+
+static ngx_int_t ngx_guangtong_test_init(ngx_conf_t *cf)
+{
+    //插入到头部处理方法链表的首部
+    ngx_http_next_header_filter = ngx_http_top_header_filter;
+    ngx_http_top_header_filter = ngx_guangtong_test_header_filter;
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_guangtong_test_header_filter(ngx_http_request_t *r)
+{
+
+    //如果不是返回成功，这时是不需要理会是否加前缀的，直接交由下一个过滤模块
+//处理响应码200的情形
+    if (r->headers_out.status == NGX_HTTP_OK)
+    {
+        return ngx_http_next_header_filter(r);
+    }
+
+
+    //交由下一个过滤模块继续处理
+    return ngx_http_next_header_filter(r);
+}
+
+
+
+static void *ngx_guangtong_test_create_conf(ngx_conf_t *cf)
+{
+    printf("123456789 in create_conf cmd is %s\n", ((ngx_str_t *)cf->args->elts)[0].data);
+    ngx_guangtong_timer_conf_t *p_conf_t;
+    
+    //创建存储配置项的结构体
+    p_conf_t = (ngx_guangtong_timer_conf_t *)ngx_pcalloc(cf->pool, sizeof(ngx_guangtong_timer_conf_t));
+    if (p_conf_t == NULL)
+    {
+        return NULL;
+    }
+    p_conf_t->my_sec = NGX_CONF_UNSET;
+
+    p_conf_t->t_rbt = (ngx_rbtree_t *)ngx_pcalloc(cf->pool, sizeof(ngx_rbtree_t));
+    p_conf_t->sentienl = (ngx_str_node_t *)ngx_pcalloc(cf->pool, sizeof(ngx_str_node_t));
+    ngx_str_null(&(p_conf_t->sentienl->str));
+    p_conf_t->sentienl->node.key = 0;
+    p_conf_t->sentienl->node.left = (ngx_rbtree_node_t *)p_conf_t->sentienl;
+    p_conf_t->sentienl->node.right = (ngx_rbtree_node_t *)p_conf_t->sentienl;
+    p_conf_t->sentienl->node.parent = (ngx_rbtree_node_t *)p_conf_t->sentienl;
+    ngx_rbtree_init(p_conf_t->t_rbt, (ngx_rbtree_node_t *)p_conf_t->sentienl, ngx_str_rbtree_insert_value);
+    
+    return p_conf_t;
+}
+
+// 因为这是一个server级别的配置，而且在create_srv_conf里面设置了默认值，所以main的配置里面有这个配置，并且值是默认值。这样如果不进行merg的话，会用main里面的那个默认值来代替我们用set方法设置的值
+static char *ngx_guangtong_test_merge_conf(ngx_conf_t *cf, void *parent, void *child) {
+    ngx_guangtong_timer_conf_t *prev = (ngx_guangtong_timer_conf_t *)parent;
+    ngx_guangtong_timer_conf_t *conf = (ngx_guangtong_timer_conf_t *)child;
+    printf("parent conf is %d\n", (int)prev->my_sec);
+    printf("child conf is %d\n", (int)conf->my_sec);
+    ngx_conf_merge_sec_value(prev->my_sec, conf->my_sec, 10000);
+    return NGX_CONF_OK;
+}
+
+
